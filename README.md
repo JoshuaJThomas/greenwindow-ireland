@@ -6,10 +6,10 @@ Live EirGrid generation data feeds a distilled **PatchTST** forecasting model (1
 
 ## How it works
 
-1. **Data** — live generation and demand data pulled from EirGrid's public feeds
-2. **Forecast** — a distilled PatchTST transformer (`assets/student.pt`) predicts carbon intensity for the next 48 hours on CPU, no GPU needed
-3. **Schedule** — `src/analysis/scheduler.py` scans the forecast for the cleanest contiguous 3-hour window
-4. **UI** — a Streamlit app presents the result
+1. **Data** - live generation and demand data pulled from EirGrid's public feeds
+2. **Forecast** - a distilled PatchTST transformer (`assets/student.pt`) predicts carbon intensity for the next 48 hours on CPU, no GPU needed
+3. **Schedule** - `src/analysis/scheduler.py` scans the forecast for the cleanest contiguous 3-hour window
+4. **UI** - a Streamlit app presents the result
 
 ## Run it
 
