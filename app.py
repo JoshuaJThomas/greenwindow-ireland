@@ -7,36 +7,31 @@ the RQ2 scheduler and shows the recommended window with an estimated
 saving for a user-chosen load (EV, home battery, appliance cycle).
 
 Runs in two modes:
-- student mode: app/assets/student.pt + stats.json exist (produced by
-  python -m src.analysis.make_app_assets after RQ3 training);
-- fallback mode: no checkpoint yet, forecast is seasonal-naive from the
+- student mode: assets/student.pt + stats.json exist;
+- fallback mode: no checkpoint, forecast is seasonal-naive from the
   fetched history, clearly labelled DEMO so nobody mistakes it for the
   benchmark model.
 
-Local run:    streamlit run app/greenwindow.py
-HF Spaces:    upload the deploy/greenwindow-space/ bundle (built by
-              python app/build_space.py; steps in the bundle's
-              DEPLOY-STEPS.md). See BATCH-PLAN.md batch 5.
+The fetching, model and scheduler live in the greenwindow package
+(src/greenwindow); this file is only the page.
+
+Local run:    streamlit run app.py
 """
-import datetime as dt
-import json
 import pathlib
 import sys
-import time
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+# Run straight from a checkout without `pip install -e .`
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
-from src.analysis.scheduler import BLOCK_STEPS, choose_block  # noqa: E402
+from greenwindow import eirgrid  # noqa: E402
+from greenwindow.forecast import HORIZON, Forecaster, naive_forecast  # noqa: E402
+from greenwindow.scheduler import BLOCK_STEPS, choose_block  # noqa: E402
 
 ASSETS = pathlib.Path(__file__).parent / "assets"
-API = "https://www.smartgriddashboard.com/api/chart/"
-LOOKBACK = 512          # student input steps
-HORIZON = 192           # 48 h at 15 min
 
 # Chart palette: CVD-validated (dataviz six-checks, light surface).
 CI_COLOUR = "#0072B2"
@@ -84,39 +79,20 @@ div[data-testid="stMetric"] {
 def fetch_series(chart_type: str, area: str, days_back: int,
                  days_ahead: int) -> pd.Series:
     """One series from the dashboard chart API (15-min, UTC index)."""
-    today = dt.date.today()
-    r = requests.get(API, params={
-        "region": "ALL", "chartType": chart_type, "dateRange": "week",
-        "dateFrom": (today - dt.timedelta(days=days_back)).isoformat(),
-        "dateTo": (today + dt.timedelta(days=days_ahead)).isoformat(),
-        "areas": area}, timeout=30,
-        headers={"User-Agent": "Mozilla/5.0 (GreenWindow demo)"})
-    r.raise_for_status()
-    j = r.json()   # the API answers {'Rows': [...]}, {'items': [...]}
-    rows = ((j.get("items") or j.get("Rows") or j.get("rows"))
-            if isinstance(j, dict) else j)         # ... or a bare list
-    frame = pd.DataFrame(rows)
-    time_col = next(c for c in frame.columns
-                    if c.lower() in ("effectivetime", "time", "datetime"))
-    val_col = next(c for c in frame.columns
-                   if c.lower() in ("value", "fieldvalue"))
-    ts = pd.to_datetime(frame[time_col], dayfirst=True)
-    if ts.dt.tz is None:
-        ts = ts.dt.tz_localize("Europe/Dublin", ambiguous=True,
-                               nonexistent="shift_forward")
-    series = (pd.Series(frame[val_col].astype(float).to_numpy(),
-                        index=ts.dt.tz_convert("UTC"))
-              .sort_index())
-    series = series[~series.index.duplicated(keep="last")]
-    return series.asfreq("15min").interpolate(limit=4)
+    return eirgrid.fetch_series(chart_type, area, days_back, days_ahead)
 
 
-def fetch_ci_history(days: int = 6) -> pd.Series:
-    # dateRange=week returns 7 days starting at dateFrom, so days=7 ends at
-    # last midnight and the forecast starts from stale data. days=6 reaches
-    # the latest reading and still covers the 512-step (~5.3-day) lookback.
-    # Do not go above 6.
-    return fetch_series("co2", "co2intensity", days, 1)
+@st.cache_data(ttl=900)
+def fetch_ci_history() -> pd.Series:
+    return eirgrid.fetch_ci_history()
+
+
+@st.cache_resource
+def load_forecaster() -> Forecaster | None:
+    try:
+        return Forecaster.from_assets(ASSETS)
+    except FileNotFoundError:
+        return None
 
 
 def student_forecast(history: pd.Series) -> tuple[np.ndarray, dict] | None:
@@ -125,42 +101,12 @@ def student_forecast(history: pd.Series) -> tuple[np.ndarray, dict] | None:
     Returns (forecast, meta) where meta has the parameter count and the
     measured forward-pass latency for the model card.
     """
-    ckpt_path, stats_path = ASSETS / "student.pt", ASSETS / "stats.json"
-    if not (ckpt_path.exists() and stats_path.exists()):
+    forecaster = load_forecaster()
+    if forecaster is None or len(history.dropna()) < forecaster.lookback:
         return None
-    import torch
-    from src.models.patchtst import PatchTST
-    from src.models.windows import add_time_features
-
-    stats = json.loads(stats_path.read_text())
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = ckpt["config"]
-    tail = history.dropna().iloc[-LOOKBACK:]
-    if len(tail) < LOOKBACK:
-        return None
-    feats = add_time_features(tail.to_frame("co2intensity"))
-    cols = list(stats["mean"].keys())
-    z = (feats[cols] - pd.Series(stats["mean"])) / pd.Series(stats["std"])
-    model = PatchTST(cfg["lookback"], cfg["horizon"], len(cols),
-                     d_model=cfg["d_model"], n_heads=4,
-                     n_layers=cfg["n_layers"], d_ff=2 * cfg["d_model"])
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
-    with torch.no_grad():
-        x = torch.from_numpy(z.to_numpy(dtype=np.float32))[None]
-        t0 = time.perf_counter()
-        out = model(x)
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-        pred_std = (out[:, :, 0] if out.dim() == 3 else out)[0].numpy()
-    mean, std = stats["mean"]["co2intensity"], stats["std"]["co2intensity"]
-    meta = {"params": sum(p.numel() for p in model.parameters()),
-            "latency_ms": latency_ms}
-    return (pred_std * std + mean)[:HORIZON], meta
-
-
-def naive_forecast(history: pd.Series) -> np.ndarray:
-    last_day = history.dropna().iloc[-96:].to_numpy()
-    return np.tile(last_day, 2)[:HORIZON]
+    fc = forecaster.predict(history)
+    return fc.values, {"params": forecaster.n_params,
+                       "latency_ms": fc.latency_ms}
 
 
 def fmt_saving(grams: float) -> str:
@@ -316,7 +262,7 @@ def main() -> None:
     st.plotly_chart(
         build_chart(history, forecast, stamps, block, origin, wind,
                     forecast_name),
-        use_container_width=True)
+        width="stretch")
 
     # Why this window?
     st.subheader("Why this window?")
