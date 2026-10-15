@@ -111,9 +111,11 @@ def fetch_series(chart_type: str, area: str, days_back: int,
     return series.asfreq("15min").interpolate(limit=4)
 
 
-def fetch_ci_history(days: int = 7) -> pd.Series:
-    # dateRange=week anchors at dateFrom: asking further back shifts the
-    # whole window into the past and staleness grows. Keep days=7.
+def fetch_ci_history(days: int = 6) -> pd.Series:
+    # dateRange=week returns 7 days starting at dateFrom, so days=7 ends at
+    # last midnight and the forecast starts from stale data. days=6 reaches
+    # the latest reading and still covers the 512-step (~5.3-day) lookback.
+    # Do not go above 6.
     return fetch_series("co2", "co2intensity", days, 1)
 
 
