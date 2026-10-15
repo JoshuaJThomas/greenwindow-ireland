@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"     # Mondays: catch EirGrid API changes early
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install (CPU-only torch)
+        run: |
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Unit and model tests (offline, recorded EirGrid data)
+        run: pytest -q
+
+      - name: Live EirGrid smoke test
+        if: github.event_name != 'pull_request'
+        run: pytest -q -m network
+
+      - name: CLI end to end
+        if: github.event_name != 'pull_request'
+        run: greenwindow forecast
+
+  docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: test
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the API image
+        run: docker build -t greenwindow-api .
+
+      - name: Start it and check /health
+        run: |
+          docker run -d --name gw -p 8000:8000 greenwindow-api
+          for i in $(seq 1 30); do
+            curl -fsS localhost:8000/health && exit 0
+            sleep 2
+          done
+          docker logs gw
+          exit 1
